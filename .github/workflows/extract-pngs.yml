@@ -1,4 +1,4 @@
-name: Extract PNG images from Jerry mod
+name: Extract Jerry entity textures (Forge 1.20.1)
 
 on:
   workflow_dispatch:
@@ -7,7 +7,7 @@ permissions:
   contents: read
 
 jobs:
-  extract-pngs:
+  inspect-and-extract:
     runs-on: ubuntu-latest
     steps:
       - name: Download the Chatgpt release asset
@@ -16,14 +16,70 @@ jobs:
             "https://github.com/10574084-cmd/jerry.images/releases/download/Chatgpt/jerry.jar.jar" \
             -o jerry.jar.jar
 
-      - name: Extract PNG files from all JAR entries
+      - name: Inspect Forge mod resources
+        run: |
+          python - <<'PY'
+          from zipfile import ZipFile, BadZipFile
+          from pathlib import Path
+          import re
+
+          jar = Path("jerry.jar.jar")
+          report = []
+          needles = ("jerry", "entity", "texture", "model", "geo", "skin", "assets", "movie")
+          try:
+              with ZipFile(jar) as z:
+                  entries = z.infolist()
+                  report.append(f"JAR size: {jar.stat().st_size} bytes")
+                  report.append(f"Total entries: {len(entries)}")
+                  report.append("\n=== ALL RESOURCE-LIKE PATHS ===")
+                  for e in entries:
+                      n = e.filename
+                      low = n.lower()
+                      if (low.startswith("assets/") or low.startswith("data/")
+                          or low.endswith(("mods.toml", "pack.mcmeta", ".png", ".png.mcmeta",
+                                           ".jpg", ".jpeg", ".webp", ".tga", ".json", ".mcmeta"))
+                          or any(k in low for k in needles)):
+                          report.append(f"{e.file_size:>12} bytes  {n}")
+                  report.append("\n=== JERRY / ENTITY / MODEL / TEXTURE REFERENCES IN CLASS AND TEXT FILES ===")
+                  hits = 0
+                  for e in entries:
+                      if e.is_dir() or not e.filename.lower().endswith((".class", ".json", ".toml", ".properties", ".txt")):
+                          continue
+                      try:
+                          raw = z.read(e)
+                      except Exception:
+                          continue
+                      strings = re.findall(rb"[ -~]{4,}", raw)
+                      matches = [s.decode("utf-8", "replace") for s in strings
+                                 if any(k.encode() in s.lower() for k in needles)]
+                      if matches:
+                          report.append(f"\n[{e.filename}]")
+                          for s in matches[:80]:
+                              report.append("  " + s[:500])
+                              hits += 1
+                  report.append(f"\nTotal matching strings: {hits}")
+          except BadZipFile:
+              raise SystemExit("The release asset is not a readable JAR/ZIP.")
+          Path("jerry-diagnostic.txt").write_text("\n".join(report), encoding="utf-8")
+          print("\n".join(report[:100]))
+          print("\nFull report saved as jerry-diagnostic.txt")
+          PY
+
+      - name: Upload diagnostic report
+        uses: actions/upload-artifact@v4
+        with:
+          name: jerry-diagnostic
+          path: jerry-diagnostic.txt
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Extract PNG images from archive entries
         run: |
           python - <<'PY'
           from pathlib import Path
           from zipfile import ZipFile, BadZipFile, ZIP_DEFLATED
           from io import BytesIO
-          import base64
-          import re
+          import base64, hashlib, re
 
           OUT = Path("png_images")
           OUT.mkdir(exist_ok=True)
@@ -36,34 +92,26 @@ jobs:
               global count
               if not data.startswith(SIG):
                   return
-              # Read PNG chunk structure through the IEND chunk, avoiding trailing bytes.
               pos = 8
-              end = None
               while pos + 12 <= len(data):
                   length = int.from_bytes(data[pos:pos+4], "big")
-                  chunk_end = pos + 12 + length
-                  if chunk_end > len(data):
+                  end = pos + 12 + length
+                  if end > len(data):
                       return
                   kind = data[pos+4:pos+8]
-                  pos = chunk_end
+                  pos = end
                   if kind == b"IEND":
-                      end = pos
-                      break
-              if end is None:
-                  return
-              png = data[:end]
-              import hashlib
-              digest = hashlib.sha256(png).hexdigest()
-              if digest in seen:
-                  return
-              seen.add(digest)
-              safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", label).strip("._") or "image"
-              target = OUT / f"{count+1:04d}_{safe}.png"
-              target.write_bytes(png)
-              count += 1
+                      png = data[:pos]
+                      digest = hashlib.sha256(png).hexdigest()
+                      if digest in seen:
+                          return
+                      seen.add(digest)
+                      safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", label).strip("._") or "image"
+                      (OUT / f"{count+1:04d}_{safe}.png").write_bytes(png)
+                      count += 1
+                      return
 
           def scan_bytes(data, label):
-              # PNG files stored as normal resources or embedded inside compiled files.
               start = 0
               while True:
                   pos = data.find(SIG, start)
@@ -71,54 +119,48 @@ jobs:
                       break
                   save_png(data[pos:], f"{label}_embedded_{pos}")
                   start = pos + len(SIG)
-
-              # Some Java resources store images as Base64 strings.
               for match in re.finditer(rb"[A-Za-z0-9+/]{256,}={0,2}", data):
                   token = match.group(0)
-                  if len(token) > 40_000_000:
-                      continue
-                  try:
-                      decoded = base64.b64decode(token, validate=False)
-                  except Exception:
-                      continue
-                  if decoded.startswith(SIG):
-                      save_png(decoded, f"{label}_base64_{match.start()}")
+                  if len(token) <= 40_000_000:
+                      try:
+                          decoded = base64.b64decode(token, validate=False)
+                          if decoded.startswith(SIG):
+                              save_png(decoded, f"{label}_base64_{match.start()}")
+                      except Exception:
+                          pass
 
           def scan_archive(blob, prefix=""):
               global scanned
-              try:
-                  with ZipFile(BytesIO(blob)) as archive:
-                      for item in archive.infolist():
-                          if item.is_dir():
-                              continue
-                          scanned += 1
-                          name = f"{prefix}{item.filename}"
+              with ZipFile(BytesIO(blob)) as archive:
+                  for item in archive.infolist():
+                      if item.is_dir():
+                          continue
+                      scanned += 1
+                      name = prefix + item.filename
+                      try:
+                          data = archive.read(item)
+                      except Exception as exc:
+                          print(f"Skipping {name}: {exc}")
+                          continue
+                      scan_bytes(data, name)
+                      if data[:4] == b"PK\\x03\\x04":
                           try:
-                              data = archive.read(item)
-                          except Exception as exc:
-                              print(f"Skipping unreadable entry {name}: {exc}")
-                              continue
-                          scan_bytes(data, name)
-                          # Also inspect nested JAR/ZIP archives.
-                          if data[:4] == b"PK\\x03\\x04":
                               scan_archive(data, name + "!")
-              except BadZipFile:
-                  raise
+                          except BadZipFile:
+                              pass
 
           try:
               scan_archive(Path("jerry.jar.jar").read_bytes())
           except BadZipFile:
               raise SystemExit("The release asset is not a readable JAR/ZIP archive.")
 
-          print(f"Scanned {scanned} archive entries; extracted {count} unique PNG images.")
-          if count == 0:
-              raise SystemExit("No PNG image data was found in the JAR.")
-          with ZipFile("jerry_pngs.zip", "w", ZIP_DEFLATED) as result:
+          print(f"Scanned {scanned} entries; extracted {count} unique PNGs.")
+          with ZipFile("jerry_pngs.zip", "w", ZIP_DEFLATED) as out:
               for file in sorted(OUT.glob("*.png")):
-                  result.write(file, file.name)
+                  out.write(file, file.name)
           PY
 
-      - name: Upload the PNG ZIP
+      - name: Upload PNG ZIP
         uses: actions/upload-artifact@v4
         with:
           name: jerry-pngs
