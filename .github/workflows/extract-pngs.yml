@@ -1,0 +1,66 @@
+name: Extract PNG images from Jerry mod
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  extract-pngs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download the Chatgpt release asset
+        run: |
+          curl -L --fail --retry 3 \
+            "https://github.com/10574084-cmd/jerry.images/releases/download/Chatgpt/jerry.jar.jar" \
+            -o jerry.jar.jar
+
+      - name: Extract PNG files
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from zipfile import ZipFile, BadZipFile, ZIP_DEFLATED
+
+          source = Path("jerry.jar.jar")
+          output_dir = Path("png_images")
+          output_dir.mkdir(exist_ok=True)
+          count = 0
+
+          try:
+              with ZipFile(source) as archive:
+                  for item in archive.infolist():
+                      if item.is_dir() or not item.filename.lower().endswith(".png"):
+                          continue
+                      data = archive.read(item)
+                      if not data.startswith(b"\\x89PNG\\r\\n\\x1a\\n"):
+                          continue
+
+                      # Keep the original folders while preventing path traversal.
+                      relative = Path(item.filename)
+                      if relative.is_absolute() or ".." in relative.parts:
+                          continue
+                      target = output_dir / relative
+                      target.parent.mkdir(parents=True, exist_ok=True)
+                      target.write_bytes(data)
+                      count += 1
+          except BadZipFile:
+              raise SystemExit("The release asset is not a readable JAR/ZIP archive.")
+
+          if count == 0:
+              raise SystemExit("No valid PNG images were found in the JAR.")
+
+          with ZipFile("jerry_pngs.zip", "w", ZIP_DEFLATED) as result:
+              for file in output_dir.rglob("*.png"):
+                  result.write(file, file.relative_to(output_dir))
+
+          print(f"Extracted {count} PNG images into jerry_pngs.zip")
+          PY
+
+      - name: Upload the PNG ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: jerry-pngs
+          path: jerry_pngs.zip
+          if-no-files-found: error
+          retention-days: 7
