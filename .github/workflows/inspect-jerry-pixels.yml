@@ -1,0 +1,117 @@
+name: Inspect Jerry private pixel resources
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect-pixels:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Download the Chatgpt release asset
+        run: |
+          curl -L --fail --retry 3 \
+            "https://github.com/10574084-cmd/jerry.images/releases/download/Chatgpt/jerry.jar.jar" \
+            -o jerry.jar.jar
+
+      - name: Inspect private pixel blobs and locate texture loader classes
+        run: |
+          python - <<'PY'
+          from zipfile import ZipFile
+          from pathlib import Path
+          import hashlib
+          import subprocess
+
+          jar = Path("jerry.jar.jar")
+          out = Path("classdump")
+          report = []
+          markers = (
+              b"Jerry texture path v1",
+              b"Jerry texture key v1",
+              b"/assets/jerry/private/pixels/",
+              b"Unable to derive the texture resource",
+          )
+          signatures = [
+              (b"\\x89PNG\\r\\n\\x1a\\n", "PNG"),
+              (b"\\xff\\xd8\\xff", "JPEG"),
+              (b"GIF87a", "GIF87a"),
+              (b"GIF89a", "GIF89a"),
+              (b"RIFF", "RIFF/WEBP candidate"),
+              (b"\\x1f\\x8b", "GZIP"),
+              (b"PK\\x03\\x04", "ZIP"),
+              (b"\\x28\\xb5\\x2f\\xfd", "Zstandard"),
+          ]
+
+          with ZipFile(jar) as z:
+              entries = z.infolist()
+              pixels = [e for e in entries
+                        if e.filename.startswith("assets/jerry/private/pixels/") and e.filename.endswith(".bin")]
+              report.append(f"JAR size: {jar.stat().st_size} bytes")
+              report.append(f"Total JAR entries: {len(entries)}")
+              report.append(f"Private pixel blobs: {len(pixels)}")
+              report.append(f"Private pixel total: {sum(e.file_size for e in pixels)} bytes")
+              report.append("\n=== PRIVATE PIXEL BLOB HEADERS ===")
+              for e in pixels:
+                  raw = z.read(e)
+                  head = raw[:48]
+                  detected = [label for sig, label in signatures if head.startswith(sig)]
+                  label = ", ".join(detected) if detected else "no standard image/compression signature"
+                  printable = "".join(chr(b) if 32 <= b < 127 else "." for b in head)
+                  report.append(f"{e.file_size:>10} bytes  {e.filename}")
+                  report.append(f"  header={head.hex()}  type={label}  ascii={printable}")
+
+              report.append("\n=== CLASSES CONTAINING TEXTURE-LOADER MARKERS ===")
+              matched = []
+              for e in entries:
+                  if e.is_dir() or not e.filename.endswith(".class"):
+                      continue
+                  raw = z.read(e)
+                  if any(m in raw for m in markers):
+                      matched.append(e)
+              report.append(f"Matched classes: {len(matched)}")
+              target_names = {
+                  "com/pkfl/jerry/internal/ygccompvajplugdbzp.class",
+                  "com/pkfl/jerry/internal/wacijsvvpsvuatkgzl.class",
+                  "com/pkfl/jerry/internal/gtceyxifdwuasndjuk.class",
+                  "com/pkfl/jerry/client/whelp.class",
+              }
+              selected = {e.filename: e for e in matched}
+              for e in entries:
+                  if e.filename in target_names:
+                      selected[e.filename] = e
+              for name, e in sorted(selected.items()):
+                  report.append(name)
+                  dest = out / name
+                  dest.parent.mkdir(parents=True, exist_ok=True)
+                  dest.write_bytes(z.read(e))
+
+          report.append("\n=== JAVAP BYTECODE / CONSTANTS ===")
+          class_files = sorted(out.rglob("*.class"))
+          for class_file in class_files:
+              report.append(f"\n##### {class_file.as_posix()} #####")
+              proc = subprocess.run(
+                  ["javap", "-p", "-c", "-constants", "-verbose", str(class_file)],
+                  capture_output=True, text=True, errors="replace"
+              )
+              report.append(proc.stdout if proc.stdout else proc.stderr)
+          Path("jerry-pixel-inspection.txt").write_text("\n".join(report), encoding="utf-8")
+          print(f"Pixel blobs inspected: {len(pixels)}")
+          print(f"Texture-loader classes disassembled: {len(class_files)}")
+          print("Report saved as jerry-pixel-inspection.txt")
+          PY
+
+      - name: Upload pixel inspection report
+        uses: actions/upload-artifact@v4
+        with:
+          name: jerry-pixel-inspection
+          path: jerry-pixel-inspection.txt
+          if-no-files-found: error
+          retention-days: 7
