@@ -27,7 +27,6 @@ jobs:
           python - <<'PY'
           from zipfile import ZipFile
           from pathlib import Path
-          import hashlib
           import subprocess
 
           jar = Path("jerry.jar.jar")
@@ -40,14 +39,14 @@ jobs:
               b"Unable to derive the texture resource",
           )
           signatures = [
-              (b"\\x89PNG\\r\\n\\x1a\\n", "PNG"),
-              (b"\\xff\\xd8\\xff", "JPEG"),
+              (bytes.fromhex("89504e470d0a1a0a"), "PNG"),
+              (bytes.fromhex("ffd8ff"), "JPEG"),
               (b"GIF87a", "GIF87a"),
               (b"GIF89a", "GIF89a"),
-              (b"RIFF", "RIFF/WEBP candidate"),
-              (b"\\x1f\\x8b", "GZIP"),
-              (b"PK\\x03\\x04", "ZIP"),
-              (b"\\x28\\xb5\\x2f\\xfd", "Zstandard"),
+              (b"RIFF", "RIFF container"),
+              (bytes.fromhex("1f8b"), "GZIP"),
+              (bytes.fromhex("504b0304"), "ZIP"),
+              (bytes.fromhex("28b52ffd"), "Zstandard"),
           ]
 
           with ZipFile(jar) as z:
@@ -63,6 +62,8 @@ jobs:
                   raw = z.read(e)
                   head = raw[:48]
                   detected = [label for sig, label in signatures if head.startswith(sig)]
+                  if head.startswith(b"RIFF") and head[8:12] == b"WEBP":
+                      detected.append("WEBP")
                   label = ", ".join(detected) if detected else "no standard image/compression signature"
                   printable = "".join(chr(b) if 32 <= b < 127 else "." for b in head)
                   report.append(f"{e.file_size:>10} bytes  {e.filename}")
